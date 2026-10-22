@@ -1,0 +1,19 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:stable scripts/retry-runner-loss.sh
+
+      - name: Bats
+        run: docker run --rm -v "$PWD":/code -w /code bats/bats:latest tests/

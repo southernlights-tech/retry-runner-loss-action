@@ -1,0 +1,74 @@
+name: Retry on runner loss
+description: >-
+  Detects whether a failed or cancelled workflow run was killed by self-hosted
+  runner loss (e.g. an EC2 Spot reclaim) and, only then, re-runs it. The caller
+  owns the workflow_run trigger, the watched-workflow allow-list and the
+  permissions; this action performs the detection, the re-run, and (optionally)
+  the PR notification.
+author: southernlights.tech
+
+inputs:
+  repo:
+    description: "owner/name of the repository."
+    required: true
+  run-id:
+    description: "The workflow run id to inspect (github.event.workflow_run.id)."
+    required: true
+  attempt:
+    description: "The run attempt (github.event.workflow_run.run_attempt)."
+    required: true
+  max-attempts:
+    description: "Maximum run attempts before the watchdog stops retrying."
+    required: false
+    default: "2"
+  pr-number:
+    description: "Pull request number to comment on when a retry is triggered (optional)."
+    required: false
+    default: ""
+  run-url:
+    description: "HTML URL of the triggering run, used in the notification comment (optional)."
+    required: false
+    default: ""
+  mention:
+    description: "Optional @handle to mention in the notification comment."
+    required: false
+    default: ""
+
+outputs:
+  retried:
+    description: "'1' when a retry was triggered, otherwise '0'."
+    value: ${{ steps.detect.outputs.retried }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect runner loss and re-run
+      id: detect
+      shell: bash
+      env:
+        REPO: ${{ inputs.repo }}
+        RUN_ID: ${{ inputs.run-id }}
+        ATTEMPT: ${{ inputs.attempt }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+      run: |
+        set -euo pipefail
+        source "${{ github.action_path }}/scripts/retry-runner-loss.sh"
+        retry_run_on_runner_loss "${REPO}" "${RUN_ID}" "${ATTEMPT}" "${MAX_ATTEMPTS}"
+        echo "retried=${RETRY_PERFORMED:-0}" >> "$GITHUB_OUTPUT"
+
+    - name: Comment on the PR
+      if: ${{ steps.detect.outputs.retried == '1' && inputs.pr-number != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        RUN_URL: ${{ inputs.run-url }}
+        ATTEMPT: ${{ inputs.attempt }}
+        MENTION: ${{ inputs.mention }}
+      run: |
+        set -euo pipefail
+        prefix=""
+        if [ -n "${MENTION}" ]; then prefix="${MENTION} - "; fi
+        gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body \
+          "A self-hosted runner was reclaimed on ${RUN_URL}; re-running the failed jobs (attempt ${ATTEMPT} -> $((ATTEMPT + 1)))."
