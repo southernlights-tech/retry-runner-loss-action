@@ -1,0 +1,32 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:stable scripts/retry-runner-loss.sh
+
+      - name: Bats
+        run: docker run --rm -v "$PWD":/code -w /code bats/bats:latest tests/
+
+      - name: Smoke test the composite action (bogus run id; must not fail)
+        uses: ./
+        with:
+          repo: ${{ github.repository }}
+          run-id: "1"
+          attempt: "1"
+        env:
+          GH_TOKEN: ${{ github.token }}
