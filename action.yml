@@ -30,7 +30,11 @@ inputs:
     required: false
     default: ""
   mention:
-    description: "Optional @handle to mention in the notification comment."
+    description: "Optional person or team to mention in the notification comment, e.g. '@octocat' or '@org/team'. A leading '@' is added if missing; when empty the comment carries no mention."
+    required: false
+    default: ""
+  token:
+    description: "Token used by the gh CLI. Defaults to the workflow's GITHUB_TOKEN."
     required: false
     default: ""
 
@@ -46,12 +50,14 @@ runs:
       id: detect
       shell: bash
       env:
+        GH_TOKEN: ${{ inputs.token || github.token }}
         REPO: ${{ inputs.repo }}
         RUN_ID: ${{ inputs.run-id }}
         ATTEMPT: ${{ inputs.attempt }}
         MAX_ATTEMPTS: ${{ inputs.max-attempts }}
       run: |
         set -euo pipefail
+        : "${GH_TOKEN:?GH_TOKEN must be set; the action defaults it to github.token}"
         source "${{ github.action_path }}/scripts/retry-runner-loss.sh"
         retry_run_on_runner_loss "${REPO}" "${RUN_ID}" "${ATTEMPT}" "${MAX_ATTEMPTS}"
         echo "retried=${RETRY_PERFORMED:-0}" >> "$GITHUB_OUTPUT"
@@ -60,7 +66,7 @@ runs:
       if: ${{ steps.detect.outputs.retried == '1' && inputs.pr-number != '' }}
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ inputs.token || github.token }}
         REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ inputs.pr-number }}
         RUN_URL: ${{ inputs.run-url }}
@@ -69,6 +75,11 @@ runs:
       run: |
         set -euo pipefail
         prefix=""
-        if [ -n "${MENTION}" ]; then prefix="${MENTION} - "; fi
+        if [ -n "${MENTION}" ]; then
+          case "${MENTION}" in
+            @*) prefix="${MENTION} - " ;;
+            *) prefix="@${MENTION} - " ;;
+          esac
+        fi
         gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body \
-          "A self-hosted runner was reclaimed on ${RUN_URL}; re-running the failed jobs (attempt ${ATTEMPT} -> $((ATTEMPT + 1)))."
+          "${prefix}A self-hosted runner was reclaimed on ${RUN_URL}; re-running the failed jobs (attempt ${ATTEMPT} -> $((ATTEMPT + 1)))."

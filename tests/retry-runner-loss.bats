@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 
-# Behavioral tests for .github/scripts/retry-runner-loss.sh.
+# Behavioral tests for scripts/retry-runner-loss.sh.
 # Stubs `gh` on a temp PATH so no API calls are made.
 
 SCRIPT="scripts/retry-runner-loss.sh"

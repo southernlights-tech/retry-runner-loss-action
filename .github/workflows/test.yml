@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,3 +21,12 @@ jobs:
 
       - name: Bats
         run: docker run --rm -v "$PWD":/code -w /code bats/bats:latest tests/
+
+      - name: Smoke test the composite action (bogus run id; must not fail)
+        uses: ./
+        with:
+          repo: ${{ github.repository }}
+          run-id: "1"
+          attempt: "1"
+        env:
+          GH_TOKEN: ${{ github.token }}
