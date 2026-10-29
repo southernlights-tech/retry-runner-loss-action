@@ -4,8 +4,7 @@
 # runner loss (e.g. an EC2 Spot reclaim) and, if so, re-run it.
 #
 # Sourced by action.yml (the composite action) and covered by
-# tests/retry-runner-loss.bats. Tracked by DEVOPS-895 / DEVOPS-908 /
-# DEVOPS-990.
+# tests/retry-runner-loss.bats.
 #
 # Requires an authenticated `gh` CLI (GH_TOKEN) plus grep/mktemp.
 #
@@ -16,7 +15,7 @@
 
 # Graceful drain: the runner printed this to its log before exiting. This is the
 # signal that fires in practice -- it was present on 5/5 of the runner-loss
-# events sampled for DEVOPS-990.
+# events sampled in production.
 RUNNER_LOSS_SIGNATURE="The runner has received a shutdown signal"
 
 # Abrupt loss: the runner vanished without printing anything, so GitHub attaches
@@ -48,7 +47,7 @@ retry_run_on_runner_loss() {
 
     # A job killed by runner loss ends `cancelled` on a graceful drain but
     # `failure` when the runner dies mid-job -- which is the common case
-    # (DEVOPS-990: 4 of the 5 observed kills concluded `failure`). Consider both,
+    # (4 of the 5 observed kills concluded `failure`). Consider both,
     # and report a failed enumeration explicitly, so that "could not list jobs"
     # is never indistinguishable from "nothing matched".
     local jobs errfile
@@ -87,7 +86,7 @@ retry_run_on_runner_loss() {
             echo "::warning::retry-runner-loss: could not create a temp file; not retrying."
             return 0
         fi
-        # DEVOPS-1029: a SUCCESSFUL fetch can still yield an empty body -- observed
+        # A SUCCESSFUL fetch can still yield an empty body -- observed
         # in production (run 39438234059 / job 118681803685), where the blob did
         # contain the signature but the fetch returned nothing, and the run was
         # silently not retried. An empty body is not evidence of absence: treat it
