@@ -1,0 +1,9 @@
+# Fixture: watched by fail/watchdog.yml.
+name: Check Lint on PR
+on:
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"

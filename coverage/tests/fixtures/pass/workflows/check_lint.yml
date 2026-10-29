@@ -1,0 +1,9 @@
+# Fixture: the one run-producing workflow in this directory that IS watched.
+name: Check Lint on PR
+on:
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"

@@ -30,3 +30,42 @@ jobs:
           attempt: "1"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The bats suite drives the script directly, so it cannot catch a typo in
+      # coverage/action.yml (input names, env mapping, action_path). The two
+      # smoke tests below exercise the SHIPPED surface instead.
+      - name: ShellCheck (coverage guard)
+        run: docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:stable coverage/scripts/coverage-check.sh
+
+      - name: Bats (coverage guard)
+        run: docker run --rm -v "$PWD":/code -w /code bats/bats:latest coverage/tests/coverage-check.bats
+
+      # Proves inputs -> env wiring and ${{ github.action_path }} resolve, and
+      # that consumer-relative paths (workspace CWD) are honoured.
+      - name: "Composite action smoke test (uses: ./coverage)"
+        uses: ./coverage
+        with:
+          watchdog: coverage/tests/fixtures/pass/watchdog.yml
+          workflows-dir: coverage/tests/fixtures/pass/workflows
+          excluded: |
+            Retry on runner loss
+
+      # Negative counterpart: a composite-action failure would fail the job, so
+      # the must-fail case drives the same script with fixture env vars and
+      # asserts a non-zero exit.
+      - name: Coverage guard must fail on an unguarded workflow
+        env:
+          WATCHDOG: coverage/tests/fixtures/fail/watchdog.yml
+          WORKFLOWS_DIR: coverage/tests/fixtures/fail/workflows
+          EXCLUDED: ""
+        run: |
+          if bash coverage/scripts/coverage-check.sh; then
+            echo "ERROR: guard passed but 'Deploy to Prod' is silently unwatched"; exit 1
+          else
+            echo "OK: guard correctly failed"
+          fi
