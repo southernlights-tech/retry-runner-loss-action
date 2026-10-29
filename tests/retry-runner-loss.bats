@@ -174,7 +174,7 @@ STUBMKTEMP
     [ "$RETRY_PERFORMED" -eq 0 ]
 }
 
-# --- DEVOPS-990: job selection ----------------------------------------------
+# --- job selection ----------------------------------------------------------
 
 @test "AC1: job query selects failure and cancelled conclusions" {
     export STUB_JOBS=""
@@ -186,7 +186,7 @@ STUBMKTEMP
     [ "$status" -eq 0 ]
 }
 
-# --- DEVOPS-990: annotation fallback is bounded ------------------------------
+# --- annotation fallback is bounded -----------------------------------------
 
 @test "AC2: log unavailable + lost-communication annotation -> rerun" {
     export STUB_JOBS="123"
@@ -231,7 +231,7 @@ STUBMKTEMP
     [ ! -f "$RERUN_MARKER" ]
 }
 
-# --- DEVOPS-990: fail-safe and error visibility ------------------------------
+# --- fail-safe and error visibility -----------------------------------------
 
 @test "AC3: log unavailable and no annotation -> no rerun (fail safe)" {
     export STUB_JOBS="123"
@@ -387,7 +387,7 @@ STUBMKTEMP
 }
 
 @test "AC1: an empty log body falls through to the annotation fallback" {
-    # DEVOPS-1029: the fetch succeeds (exit 0) but writes nothing. Before the fix
+    # The fetch succeeds (exit 0) but writes nothing. Before the fix
     # this was treated as "no signature" and the run was silently not retried.
     export STUB_JOBS="123"
     export STUB_LOG_EMPTY="1"
@@ -411,7 +411,7 @@ STUBMKTEMP
 }
 
 @test "AC2: a non-empty log without the signature never consults annotations" {
-    # The DEVOPS-990 fail-safe: a readable log is authoritative. An ambiguous
+    # The fail-safe: a readable log is authoritative. An ambiguous
     # annotation must not be able to turn a genuine failure into a retry.
     export STUB_JOBS="123"
     export STUB_LOG="genuine failure output"
