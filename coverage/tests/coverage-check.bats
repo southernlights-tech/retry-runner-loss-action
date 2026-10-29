@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 
-# Behavioural tests for coverage/scripts/coverage-check.sh (DEVOPS-1130).
+# Behavioural tests for coverage/scripts/coverage-check.sh.
 #
 # SELF-CONTAINED FIXTURES: every test builds a throwaway workflows directory in
 # a temp dir and points the script at it through WATCHDOG / WORKFLOWS_DIR /

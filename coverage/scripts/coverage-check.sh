@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# coverage-check.sh — watchdog coverage guard (DEVOPS-1130).
+# coverage-check.sh — watchdog coverage guard.
 #
 # The runner-loss watchdog subscribes to a hard-coded ALLOW-LIST of workflow
 # names via `on.workflow_run.workflows:`. A run-producing workflow whose `name:`
@@ -59,7 +59,7 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# Parsers (ported from gitops .github/bin/test_watchdog_coverage.sh)
+# Parsers
 # ---------------------------------------------------------------------------
 
 # workflow_files — every workflow file, sorted, one path per line.
