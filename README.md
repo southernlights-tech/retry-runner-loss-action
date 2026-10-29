@@ -123,6 +123,17 @@ and the action it guards can never drift apart by version.
    contradictory policy). Without this, a stale exclusion would silently mask a
    future workflow that reuses the name.
 
+**Assertion (c) fails closed.** It refuses to guess: a job-level
+`permissions:` written as an inline value (`{}`, `read-all`, `write-all`, or
+anything else), a `permissions:` key whose block cannot be read, and a `types:`
+declaration that is not a list of `completed` all cause a **failure naming the
+file and the construct**, never a fallback to a weaker source of evidence. The
+same rule applies to the workflow-level `permissions:` when the job has none. The
+reason is the asymmetry: a false FAIL costs one confusing CI run, while a false PASS
+in a safety guard silently certifies a contract that does not hold -- a retry job
+without the token it needs would then fail (or never fire) exactly when runner
+loss is being recovered.
+
 On success it prints one line:
 `<N> workflow(s): <W> watched, <E> excluded, 0 gaps`.
 

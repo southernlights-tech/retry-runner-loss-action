@@ -30,7 +30,18 @@
 #       action keeps the trigger ([completed] only, inside on.workflow_run),
 #       job gate (failure + cancelled), runner (ubuntu-latest), permissions
 #       and action ref the retry action requires. Scoped to THAT job block: a
-#       decoy second job cannot satisfy the contract on its behalf.
+#       decoy second job cannot satisfy the contract on its behalf. Only a real
+#       `uses:` line IN that job counts as calling the action (a comment in an
+#       unrelated job must not).
+#
+# Assertion (c) is FAIL-CLOSED. When the parser cannot confidently determine a
+# fact it FAILS loudly, naming the file and the construct, and never falls back
+# to a weaker source of evidence that could pass. Concretely: an inline
+# `permissions:` value (`{}`, `read-all`, `write-all`, anything else), a
+# `permissions:` key that cannot be read as a block, and an unparseable
+# `types:` form are all hard failures. A false PASS in a safety guard is worse
+# than a false FAIL — a passing guard that cannot actually see the scope leaves
+# the retry job unable to obtain the token it needs.
 #   (d) Stale-exclusion detection — every name in $EXCLUDED matches a real
 #       workflow's top-level `name:`. A stale exclusion would otherwise mask a
 #       future workflow that reuses the name. A name that is BOTH watched and
@@ -88,13 +99,17 @@ strip_quotes() {
 
 # top_level_name FILE — the first top-level `name:` value, with ONE matched
 # surrounding quote pair stripped (e.g. `name: "CSIT dev gate"` ->
-# `CSIT dev gate`). Block-scalar forms (`name: >-`) are rejected loudly rather
-# than silently mis-parsed into `>-`.
+# `CSIT dev gate`). An UNQUOTED scalar has any trailing ` # comment` stripped
+# (`name: Build  # external` -> `Build`); quoted scalars are left untouched
+# because `#` is content inside quotes. Block-scalar forms (`name: >-`) are
+# rejected loudly rather than silently mis-parsed into `>-`.
 top_level_name() {
   local raw
-  raw="$(awk '
+  raw="$(awk -v sq="'" '
     /^name:/ {
       v = $0; sub(/^name:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+      # YAML only starts a comment at `#` preceded by whitespace.
+      if (v !~ ("^[\"" sq "]")) sub(/[[:space:]]+#.*$/, "", v)
       print v; exit
     }
   ' "$1")"
@@ -158,12 +173,28 @@ allow_list() {
   ' "$1"
 }
 
-# workflow_run_types FILE — the value of `types:` INSIDE the
-# `on.workflow_run:` block, e.g. `[completed]`. Empty output means the block has
-# no `types:` key. Scoping matters: an unrelated `types: [completed]` elsewhere
-# in the file (e.g. under a `workflow_dispatch:`) must not satisfy the contract.
+# workflow_run_types FILE — the items of `types:` INSIDE the `on.workflow_run:`
+# block, normalised, one per line. Empty output means the block has no `types:`
+# key. Scoping matters: an unrelated `types: [completed]` elsewhere in the file
+# (e.g. under a `workflow_dispatch:`) must not satisfy the contract.
+#
+# All three legal spellings normalise to the same items:
+#   types: [completed]        / types: ['completed'] / types: ["completed"]
+#   types:
+#     - completed
+# An unparseable form (a bare scalar `types: completed`, a block scalar, a
+# non-list item inside the block list, ...) prints a `!!` marker line instead of
+# guessing — the caller must FAIL on it (fail-closed).
 workflow_run_types() {
-  awk '
+  awk -v sq="'" '
+    BEGIN { types_indent = -1 }
+    function trim(v) { gsub(/^[[:space:]]+/, "", v); gsub(/[[:space:]]+$/, "", v); return v }
+    function unq(v,   f, l) {
+      if (length(v) < 2) return v
+      f = substr(v, 1, 1); l = substr(v, length(v), 1)
+      if ((f == "\"" || f == sq) && f == l) return substr(v, 2, length(v) - 2)
+      return v
+    }
     /^[[:space:]]+workflow_run:[[:space:]]*$/ {
       in_wr = 1; match($0, /^[[:space:]]*/); wr_indent = RLENGTH; next
     }
@@ -171,9 +202,30 @@ workflow_run_types() {
       if ($0 ~ /^[[:space:]]*(#|$)/) next
       match($0, /^[[:space:]]*/); ind = RLENGTH
       if (ind <= wr_indent) { in_wr = 0; next }
+      # Inside a block-style `types:` list.
+      if (types_indent >= 0) {
+        if (ind <= types_indent) { types_indent = -1 }
+        else {
+          if ($0 !~ /^[[:space:]]*-[[:space:]]+/) {
+            print "!! type block item is not a list entry: " trim($0); exit
+          }
+          v = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", v)
+          print unq(trim(v)); next
+        }
+      }
       if ($0 ~ /^[[:space:]]+types:[[:space:]]*/) {
-        v = $0; sub(/^[[:space:]]+types:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
-        print v; exit
+        v = $0; sub(/^[[:space:]]+types:[[:space:]]*/, "", v); v = trim(v)
+        sub(/[[:space:]]+#.*$/, "", v)
+        if (v == "") { match($0, /^[[:space:]]*/); types_indent = RLENGTH; next }
+        if (v ~ /^\[/) {
+          sub(/^\[/, "", v); sub(/\][[:space:]]*$/, "", v)
+          n = split(v, part, ",")
+          for (i = 1; i <= n; i++) {
+            p = trim(part[i]); if (p != "") print unq(p)
+          }
+          exit
+        }
+        print "!! types value is not a list: " v; exit
       }
     }
   ' "$1"
@@ -242,24 +294,70 @@ is_run_producing() {
   printf '%s\n' "${keys}" | grep -qvx 'workflow_call'
 }
 
-# gate_block — the text of every job-level `if:` value found on STDIN, in both
-# the single-line form (`if: ${{ ... }}`) and the folded/literal block form
-# (`if: >-` followed by indented continuation lines). Reads STDIN so callers can
-# scope it to a single job block.
+# gate_block INDENT — the text of every job-key-level `if:` value found on
+# STDIN, in both the single-line form (`if: ${{ ... }}`) and the folded/literal
+# block form (`if: >-` followed by indented continuation lines). Reads STDIN so
+# callers can scope it to a single job block, and takes the indentation of the
+# job's own keys so a STEP-level `if:` (indented deeper, under `steps:`) can
+# never satisfy the JOB gate. Scanning also stops at the job's `steps:` key.
 gate_block() {
-  awk '
-    /^[[:space:]]+if:[[:space:]]*/ {
-      line = $0; sub(/^[[:space:]]+if:[[:space:]]*/, "", line)
-      # Not a block scalar -> the whole condition is on this line.
-      if (line !~ /^[>|][-+]?[[:space:]]*$/) { print line; next }
-      match($0, /^[[:space:]]*/); base = RLENGTH; in_blk = 1; next
-    }
-    in_blk {
-      if ($0 ~ /^[[:space:]]*(#|$)/) { print; next }
+  awk -v want="$1" '
+    {
+      if (in_blk) {
+        # Blank / comment lines inside the scalar are part of the value.
+        if ($0 ~ /^[[:space:]]*(#|$)/) { print; next }
+        match($0, /^[[:space:]]*/)
+        if (RLENGTH <= base) { in_blk = 0 }   # dedented: fall through to key handling
+        else { print; next }
+      }
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
       match($0, /^[[:space:]]*/)
-      if (RLENGTH <= base) { in_blk = 0; next }
-      print
+      if (RLENGTH != want) next               # not a job-key-level line
+      line = $0; sub(/^[[:space:]]*/, "", line)
+      if (line ~ /^if:/) {
+        v = line; sub(/^if:[[:space:]]*/, "", v)
+        if (v !~ /^[>|][-+]?[[:space:]]*$/) { print v; next }
+        base = want; in_blk = 1; next
+      }
+      if (line ~ /^steps:[[:space:]]*(#.*)?$/) exit
     }
+  '
+}
+
+# permissions_key [INDENT] — classify the first `permissions:` key on STDIN.
+# INDENT ("any" by default) selects the key by column; a number requires that
+# exact indentation (0 = workflow level, the job-key column = job level).
+# Prints exactly one line:
+#   __NONE__         no `permissions:` key at that indentation
+#   __BLOCK__        key present with NO inline value (a block follows)
+#   __INLINE__:<v>   key present with an inline value (`{}`, `read-all`, ...)
+# The caller treats an inline value as uninterpretable — never as a permission
+# grant (fail-closed).
+permissions_key() {
+  awk -v want="${1:-any}" '
+    !seen && $0 ~ /^[[:space:]]*permissions:/ {
+      match($0, /^[[:space:]]*/)
+      if (want == "any" || RLENGTH == want) {
+        seen = 1
+        v = $0; sub(/^[[:space:]]*permissions:[[:space:]]*/, "", v)
+        sub(/[[:space:]]+$/, "", v)
+        if (v == "" || v ~ /^#/) print "__BLOCK__"
+        else print "__INLINE__:" v
+      }
+    }
+    END { if (!seen) print "__NONE__" }
+  '
+}
+
+# body_indent — the indentation of the first non-blank, non-comment line AFTER
+# the first line of STDIN. For a job block produced by retry_job() (job key on
+# line 1) that is the job-key column: `if:`, `runs-on:`, `permissions:` and
+# `steps:` all sit there, while step-level keys sit deeper.
+body_indent() {
+  awk '
+    NR == 1 { next }
+    /^[[:space:]]*(#|$)/ { next }
+    { match($0, /^[[:space:]]*/); print RLENGTH; exit }
   '
 }
 
@@ -269,8 +367,9 @@ gate_block() {
 permissions_block() {
   awk -v want="${1:-any}" '
     # The `permissions:` key may be workflow-level or job-level depending on the
-    # caller, so its indentation is what selects the block.
-    $0 ~ /^[[:space:]]*permissions:[[:space:]]*$/ && !inp {
+    # caller, so its indentation is what selects the block. A trailing comment
+    # after the key (`permissions:  # narrowed on purpose`) is allowed.
+    $0 ~ /^[[:space:]]*permissions:[[:space:]]*(#.*)?$/ && !inp {
       match($0, /^[[:space:]]*/)
       if (want == "any" || RLENGTH == want) { base = RLENGTH; inp = 1 }
       next
@@ -289,9 +388,13 @@ permissions_block() {
 # at the same indentation. Empty output means NO job calls the action, which is
 # itself a contract violation: a decoy job must not be able to satisfy
 # assertion (c) on behalf of the real retry job.
+#
+# The marker only counts on a REAL `uses:` entry (`- uses: ...` / `uses: ...`),
+# so a comment line in an unrelated job that merely mentions the action string
+# cannot hijack the lookup. A trailing comment after the `jobs:` key is allowed.
 retry_job() {
   awk -v marker='southernlights-tech/retry-runner-loss-action@' '
-    /^jobs:[[:space:]]*$/ { in_jobs = 1; job_indent = -1; next }
+    /^jobs:[[:space:]]*(#.*)?$/ { in_jobs = 1; job_indent = -1; next }
     in_jobs {
       if ($0 ~ /^[[:space:]]*(#|$)/) { if (have) buf = buf $0 "\n"; next }
       match($0, /^[[:space:]]*/); ind = RLENGTH
@@ -299,13 +402,16 @@ retry_job() {
       if (job_indent < 0) job_indent = ind
       if (ind == job_indent) {
         # A new job key: flush the previous block if it held the action.
-        if (have && index(buf, marker) > 0) { printf "%s", buf; found = 1; exit }
-        have = 1; buf = $0 "\n"; next
+        if (have && has_action) { printf "%s", buf; found = 1; exit }
+        have = 1; has_action = 0; buf = $0 "\n"; next
       }
-      if (have) buf = buf $0 "\n"
+      if (have) {
+        buf = buf $0 "\n"
+        if ($0 ~ /^[[:space:]]*(-[[:space:]]+)?uses:/ && index($0, marker) > 0) has_action = 1
+      }
     }
     END {
-      if (!found && have && index(buf, marker) > 0) printf "%s", buf
+      if (!found && have && has_action) printf "%s", buf
     }
   ' "$1"
 }
@@ -404,22 +510,45 @@ fi
 # Assertion (c): watchdog caller contract, SCOPED TO THE JOB THAT CALLS THE
 # ACTION. Every check below reads that job's block, so a decoy second job
 # (ubuntu-latest + full gate + permissions) cannot paper over a broken retry job.
+#
+# FAIL-CLOSED throughout: see the header comment. If a construct cannot be
+# interpreted confidently, (c) fails instead of falling back to weaker evidence.
 # ---------------------------------------------------------------------------
 # (c1) on.workflow_run.types is EXACTLY [completed] — and lives inside the
 # `workflow_run:` block, so an unrelated `types: [completed]` under another
-# trigger cannot satisfy it.
-wr_types="$(workflow_run_types "${watchdog}" | tr -d '[:space:]')"
-[ "${wr_types}" = '[completed]' ] \
-  || fail "(c) on.workflow_run.types must be [completed]"
+# trigger cannot satisfy it. Flow list, quoted flow list and block list are
+# normalised to the same item list; anything else is unparseable and FAILS.
+wr_types="$(workflow_run_types "${watchdog}")"
+case "${wr_types}" in
+  '!!'*)
+    fail "(c) on.workflow_run.types in ${watchdog} could not be parsed as a list: ${wr_types#'!! '} — refusing to guess"
+    ;;
+esac
+[ "${wr_types}" = 'completed' ] \
+  || fail "(c) on.workflow_run.types must be [completed] and nothing else"
 
 # (c2) locate the job that calls the shared action; the rest of (c) is scoped to
-# that job's block.
+# that job's block. This IS the single action-pin assertion: retry_job only
+# returns a block whose real `uses:` line carries the `@`-pinned marker, so an
+# empty result covers both "no such job" and "not pinned" (a comment elsewhere
+# cannot satisfy it).
 job="$(retry_job "${watchdog}")"
 [ -n "${job}" ] \
-  || fail "(c) does not call southernlights-tech/retry-runner-loss-action@ (no job block references the action)"
+  || fail "(c) does not call southernlights-tech/retry-runner-loss-action@ (no job's \`uses:\` entry references the action)"
 
-# (c3) the gate tests both failure and cancelled conclusions.
-gate="$(printf '%s\n' "${job}" | gate_block)"
+# The column at which the job's own keys (`if:`, `runs-on:`, `permissions:`,
+# `steps:`) sit. Used to scope the gate and permissions checks to the JOB, never
+# to a step. If it cannot be determined, fail rather than guess.
+job_keys_indent="$(printf '%s\n' "${job}" | body_indent)"
+case "${job_keys_indent}" in
+  ''|*[!0-9]*)
+    fail "(c) could not determine the indentation of the retry job's keys in ${watchdog}"
+    ;;
+esac
+
+# (c3) the gate tests both failure and cancelled conclusions. A step-level `if:`
+# is indented deeper and is ignored; scanning stops at the job's `steps:`.
+gate="$(printf '%s\n' "${job}" | gate_block "${job_keys_indent}")"
 printf '%s' "${gate}" | grep -Fq "github.event.workflow_run.conclusion == 'failure'" \
   || fail "(c) job gate does not test conclusion == 'failure'"
 printf '%s' "${gate}" | grep -Fq "github.event.workflow_run.conclusion == 'cancelled'" \
@@ -429,22 +558,40 @@ printf '%s' "${gate}" | grep -Fq "github.event.workflow_run.conclusion == 'cance
 printf '%s\n' "${job}" | grep -Eq '^[[:space:]]+runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' \
   || fail "(c) runs-on must be ubuntu-latest"
 
-# (c5) the four permission scopes the shared action requires. They are
-# legitimately workflow-level OR job-level; a job-level block replaces the
-# workflow one for that job, so when present it must carry all four.
-if printf '%s\n' "${job}" | grep -Eq '^[[:space:]]+permissions:[[:space:]]*$'; then
-  perms="$(printf '%s\n' "${job}" | permissions_block any)"
-else
-  perms="$(permissions_block 0 < "${watchdog}")"
-fi
+# (c5) the four permission scopes the shared action requires, FAIL-CLOSED.
+# A job-level `permissions:` key in ANY non-block form (`{}`, `read-all`,
+# `write-all`, any other inline value) is NOT interpreted: it cannot be shown to
+# grant the required scopes, so it fails instead of falling back to the (possibly
+# broader) workflow-level block. Only an explicit job-level block is read. With
+# no job-level key at all, the workflow-level key is read under the same rule.
+perms=""
+job_perms="$(printf '%s\n' "${job}" | permissions_key "${job_keys_indent}")"
+case "${job_perms}" in
+  '__INLINE__:'*)
+    fail "(c) job-level \`permissions:\` in ${watchdog} must be an explicit block listing the scopes, not an inline value (found: '${job_perms#__INLINE__:}')"
+    ;;
+  '__BLOCK__')
+    perms="$(printf '%s\n' "${job}" | permissions_block "${job_keys_indent}")"
+    ;;
+  *)
+    wf_perms="$(permissions_key 0 < "${watchdog}")"
+    case "${wf_perms}" in
+      '__INLINE__:'*)
+        fail "(c) workflow-level \`permissions:\` in ${watchdog} must be an explicit block listing the scopes, not an inline value (found: '${wf_perms#__INLINE__:}')"
+        ;;
+      '__BLOCK__')
+        perms="$(permissions_block 0 < "${watchdog}")"
+        ;;
+      *)
+        fail "(c) no \`permissions:\` block at job or workflow level in ${watchdog}"
+        ;;
+    esac
+    ;;
+esac
 for scope in 'contents: read' 'actions: write' 'pull-requests: write' 'checks: read'; do
   printf '%s\n' "${perms}" | grep -Eq "^[[:space:]]*${scope}[[:space:]]*$" \
     || fail "(c) missing required permission: ${scope}"
 done
-
-# (c6) it calls the pinned shared action — inside that same job block.
-printf '%s' "${job}" | grep -Fq 'southernlights-tech/retry-runner-loss-action@' \
-  || fail "(c) does not call southernlights-tech/retry-runner-loss-action@"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -464,6 +464,303 @@ YAML
     [[ "$output" == *"(c) does not call southernlights-tech/retry-runner-loss-action@"* ]]
 }
 
+# --- (c) fail-closed parser regressions --------------------------------------
+
+@test "FAIL (c): a job-level 'permissions: {}' fails instead of falling back" {
+    # A flow-empty job-level block cannot be shown to grant the scopes. The
+    # detector used to require a bare `permissions:` line and silently fell back
+    # to the (valid) workflow-level block — a false PASS.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    permissions: {}
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *'job-level `permissions:`'* ]]
+    [[ "$output" == *"must be an explicit block"* ]]
+    [[ "$output" == *"found: '{}'"* ]]
+}
+
+@test "FAIL (c): a job-level 'permissions: read-all' fails (not interpreted)" {
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    permissions: read-all
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *'job-level `permissions:`'* ]]
+    [[ "$output" == *"must be an explicit block"* ]]
+    [[ "$output" == *"found: 'read-all'"* ]]
+}
+
+@test "FAIL (c): job-level permissions with a trailing comment is still a block" {
+    # `permissions:  # narrowed on purpose` is a BLOCK key, not an inline value;
+    # its body is the evidence, and it must carry all four scopes.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    permissions:  # narrowed on purpose
+      contents: read
+      actions: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"(c) missing required permission: checks: read"* ]]
+}
+
+@test "FAIL (c): a STEP-level if: does not satisfy the JOB gate" {
+    # The job gates on 'failure' only. A step-level `if:` mentioning 'cancelled'
+    # used to be swept up by the gate parser, turning a broken job gate green.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - if: ${{ github.event.workflow_run.conclusion == 'cancelled' }}
+        uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"(c) job gate does not test conclusion == 'cancelled'"* ]]
+}
+
+@test "PASS (c): a block-style types: list containing only completed" {
+    # `types:` split across a block list is the same declaration as the flow
+    # form `[completed]`; demanding the literal flow text false-FAILed it.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types:
+      - completed
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 gaps"* ]]
+}
+
+@test "PASS (c): a quoted flow-style types: ['completed'] list" {
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: ['completed']
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 gaps"* ]]
+}
+
+@test "FAIL (c): a comment mentioning the action does not make a retry job" {
+    # The marker is matched only on a real `uses:` entry. Here an unrelated job
+    # carries the action string in a COMMENT only, so no job calls the action
+    # and the guard must say so instead of scoping (c) to that job.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      # uses: southernlights-tech/retry-runner-loss-action@v1
+      - run: echo "nothing to retry"
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"(c) does not call southernlights-tech/retry-runner-loss-action@"* ]]
+    [[ "$output" == *"no job's \`uses:\` entry references the action"* ]]
+}
+
+@test "PASS (c): a trailing comment after the jobs: key still detects the job" {
+    # `jobs:  # comment` used to hide the whole jobs block, producing the
+    # misleading "does not call ..." failure for a perfectly good watchdog.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:  # every job lives below here
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"0 gaps"* ]]
+}
+
+@test "PASS (a/b): an unquoted name with a trailing comment resolves to its value" {
+    # `name: Build  # external` is `Build`; taking the comment as part of the
+    # name reported a phantom, unwatched workflow called `Build  # external`.
+    wf build.yml <<'YAML'
+name: Build  # external
+on:
+  push:
+YAML
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+      - Build
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"5 workflow(s)"* ]]
+    [[ "$output" == *"4 watched"* ]]
+    [[ "$output" == *"0 gaps"* ]]
+    [[ "$output" != *"# external"* ]]
+}
+
 # --- (d) stale exclusion / contradictory policy -----------------------------
 
 @test "FAIL (d): an exclusion name that matches no workflow" {
