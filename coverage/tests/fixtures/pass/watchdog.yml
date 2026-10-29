@@ -1,0 +1,27 @@
+# Fixture: a fully valid watchdog caller contract.
+#
+# Exists so the composite action itself can be exercised end-to-end via
+# `uses: ./coverage` — a typo in coverage/action.yml (input name, env mapping,
+# ${{ github.action_path }}) would pass the bats suite, which only drives the
+# script directly, but fail here.
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Check Lint on PR
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+        with:
+          repo: ${{ github.repository }}

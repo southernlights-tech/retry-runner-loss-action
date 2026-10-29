@@ -1,0 +1,11 @@
+# Fixture: THE GAP. Run-producing, named in no allow-list, and not excluded.
+name: Deploy to Prod
+on:
+  push:
+    branches:
+      - main
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"

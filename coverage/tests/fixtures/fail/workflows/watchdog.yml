@@ -1,0 +1,11 @@
+# Fixture: watched by fail/watchdog.yml (keeps the watchdog itself accounted
+# for, so the ONLY gap in this fixture is deploy.yml).
+name: Retry on runner loss
+on:
+  workflow_run:
+    types: [completed]
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"

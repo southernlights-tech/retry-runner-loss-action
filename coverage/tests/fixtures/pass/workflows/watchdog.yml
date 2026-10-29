@@ -1,0 +1,12 @@
+# Fixture: the watchdog itself is a run-producing workflow, so it must appear
+# in the workflows directory to be accounted for (here: via the `excluded`
+# input, which proves that input is wired through the composite action too).
+name: Retry on runner loss
+on:
+  workflow_run:
+    types: [completed]
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
