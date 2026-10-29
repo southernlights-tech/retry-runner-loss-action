@@ -26,8 +26,11 @@
 #       scalar/flow form such as `on: [push]`, or zero keys) FAILS the guard by
 #       name rather than being skipped — a silent skip is how the original blind
 #       spot arose.
-#   (c) Caller contract — $WATCHDOG keeps the trigger, job gate, runner,
-#       permissions and action ref the retry action requires.
+#   (c) Caller contract — the job in $WATCHDOG that calls the shared retry
+#       action keeps the trigger ([completed] only, inside on.workflow_run),
+#       job gate (failure + cancelled), runner (ubuntu-latest), permissions
+#       and action ref the retry action requires. Scoped to THAT job block: a
+#       decoy second job cannot satisfy the contract on its behalf.
 #   (d) Stale-exclusion detection — every name in $EXCLUDED matches a real
 #       workflow's top-level `name:`. A stale exclusion would otherwise mask a
 #       future workflow that reuses the name. A name that is BOTH watched and
@@ -64,21 +67,58 @@ workflow_files() {
   find "${workflows_dir}" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort
 }
 
-# top_level_name FILE — the first top-level `name:` value, with surrounding
-# single/double quotes stripped (e.g. `name: "CSIT dev gate"` -> `CSIT dev gate`).
+# strip_quotes VALUE — strip ONE leading and ONE trailing quote character, and
+# only when the two are present, identical, and enclose the whole value.
+# Interior quotes are preserved: `Don't deploy yet` must keep its apostrophe.
+strip_quotes() {
+  local v="$1"
+  local n=${#v}
+  local f l
+  if [ "${n}" -ge 2 ]; then
+    f="${v:0:1}"
+    l="${v:${n}-1:1}"
+    if [ "${f}" = '"' ] || [ "${f}" = "'" ]; then
+      if [ "${f}" = "${l}" ]; then
+        v="${v:1:${n}-2}"
+      fi
+    fi
+  fi
+  printf '%s' "${v}"
+}
+
+# top_level_name FILE — the first top-level `name:` value, with ONE matched
+# surrounding quote pair stripped (e.g. `name: "CSIT dev gate"` ->
+# `CSIT dev gate`). Block-scalar forms (`name: >-`) are rejected loudly rather
+# than silently mis-parsed into `>-`.
 top_level_name() {
-  awk '
+  local raw
+  raw="$(awk '
     /^name:/ {
       v = $0; sub(/^name:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
       print v; exit
     }
-  ' "$1" | tr -d "\"'"
+  ' "$1")"
+  case "${raw}" in
+    '|'*|'>'*)
+      fail "$(basename "$1") has a block-scalar top-level \`name:\` ('${raw}') — this guard only understands single-line names"
+      ;;
+  esac
+  strip_quotes "${raw}"
 }
 
 # allow_list FILE — the names under `on.workflow_run.workflows:`, one per line,
-# quotes stripped. Scoped to the `workflows:` sub-block of `workflow_run:`.
+# with ONE matched quote pair stripped. Scoped to the `workflows:` sub-block of
+# `workflow_run:` and terminated generically by the NEXT key at the same
+# indentation, so a sibling list (`branches:`) cannot leak phantom entries.
+# Both block style (`- Name` lines) and flow style (`workflows: [A, B]`) parse.
 allow_list() {
-  awk '
+  awk -v sq="'" '
+    function unq(v,   f, l) {
+      if (length(v) < 2) return v
+      f = substr(v, 1, 1); l = substr(v, length(v), 1)
+      if ((f == "\"" || f == sq) && f == l) return substr(v, 2, length(v) - 2)
+      return v
+    }
     # Enter the workflow_run block, remembering its own indentation.
     /^[[:space:]]+workflow_run:[[:space:]]*$/ {
       in_wr = 1; in_wf = 0; match($0, /^[[:space:]]*/); wr_indent = RLENGTH; next
@@ -89,15 +129,54 @@ allow_list() {
       match($0, /^[[:space:]]*/); ind = RLENGTH
       # A line at or left of workflow_run is no longer inside it.
       if (ind <= wr_indent) { in_wr = 0; in_wf = 0; next }
-      if ($0 ~ /^[[:space:]]+workflows:[[:space:]]*$/) { in_wf = 1; next }
-      if (in_wf && $0 ~ /^[[:space:]]+types:/) { in_wf = 0; next }
+      if (in_wf) {
+        # ANY key at or left of `workflows:` ends the list (types:, branches:,
+        # ...) — not just `types:`.
+        if (ind <= wf_indent) { in_wf = 0; next }
+        # Item of the block-style list, e.g. "      - Check Lint on PR".
+        if ($0 ~ /^[[:space:]]*-[[:space:]]+/) {
+          v = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+          print unq(v)
+        }
+        next
+      }
+      if ($0 ~ /^[[:space:]]+workflows:[[:space:]]*/) {
+        # Flow style: `workflows: [Test, Retry on runner loss]`.
+        line = $0; sub(/^[[:space:]]+workflows:[[:space:]]*/, "", line)
+        if (line ~ /^\[/) {
+          sub(/^\[/, "", line); sub(/\][[:space:]]*$/, "", line)
+          n = split(line, part, ",")
+          for (i = 1; i <= n; i++) {
+            v = part[i]; gsub(/^[[:space:]]+/, "", v); gsub(/[[:space:]]+$/, "", v)
+            if (v != "") print unq(v)
+          }
+          next
+        }
+        in_wf = 1; wf_indent = ind
+      }
     }
-    # Items of the workflows: list, e.g. "      - Check Lint on PR".
-    in_wf && /^[[:space:]]*-[[:space:]]+/ {
-      v = $0; sub(/^[[:space:]]*-[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
-      print v
+  ' "$1"
+}
+
+# workflow_run_types FILE — the value of `types:` INSIDE the
+# `on.workflow_run:` block, e.g. `[completed]`. Empty output means the block has
+# no `types:` key. Scoping matters: an unrelated `types: [completed]` elsewhere
+# in the file (e.g. under a `workflow_dispatch:`) must not satisfy the contract.
+workflow_run_types() {
+  awk '
+    /^[[:space:]]+workflow_run:[[:space:]]*$/ {
+      in_wr = 1; match($0, /^[[:space:]]*/); wr_indent = RLENGTH; next
     }
-  ' "$1" | tr -d "\"'"
+    in_wr {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      match($0, /^[[:space:]]*/); ind = RLENGTH
+      if (ind <= wr_indent) { in_wr = 0; next }
+      if ($0 ~ /^[[:space:]]+types:[[:space:]]*/) {
+        v = $0; sub(/^[[:space:]]+types:[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+        print v; exit
+      }
+    }
+  ' "$1"
 }
 
 # on_block_keys FILE — the keys at the `on:` block's base indentation, one per
@@ -163,9 +242,10 @@ is_run_producing() {
   printf '%s\n' "${keys}" | grep -qvx 'workflow_call'
 }
 
-# gate_block FILE — the text of every job-level `if:` value, in both the
-# single-line form (`if: ${{ ... }}`) and the folded/literal block form
-# (`if: >-` followed by indented continuation lines).
+# gate_block — the text of every job-level `if:` value found on STDIN, in both
+# the single-line form (`if: ${{ ... }}`) and the folded/literal block form
+# (`if: >-` followed by indented continuation lines). Reads STDIN so callers can
+# scope it to a single job block.
 gate_block() {
   awk '
     /^[[:space:]]+if:[[:space:]]*/ {
@@ -179,6 +259,53 @@ gate_block() {
       match($0, /^[[:space:]]*/)
       if (RLENGTH <= base) { in_blk = 0; next }
       print
+    }
+  '
+}
+
+# permissions_block [INDENT] — the body of the first `permissions:` block on
+# STDIN. With INDENT ("any" by default) the key may sit at any indentation; with
+# a number (e.g. `0` for workflow level) it must sit at exactly that column.
+permissions_block() {
+  awk -v want="${1:-any}" '
+    # The `permissions:` key may be workflow-level or job-level depending on the
+    # caller, so its indentation is what selects the block.
+    $0 ~ /^[[:space:]]*permissions:[[:space:]]*$/ && !inp {
+      match($0, /^[[:space:]]*/)
+      if (want == "any" || RLENGTH == want) { base = RLENGTH; inp = 1 }
+      next
+    }
+    inp {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      match($0, /^[[:space:]]*/)
+      if (RLENGTH <= base) { inp = 0; next }
+      print
+    }
+  '
+}
+
+# retry_job FILE — the job block of `jobs:` that references the shared retry
+# action, printed from its job key through to (but not including) the next key
+# at the same indentation. Empty output means NO job calls the action, which is
+# itself a contract violation: a decoy job must not be able to satisfy
+# assertion (c) on behalf of the real retry job.
+retry_job() {
+  awk -v marker='southernlights-tech/retry-runner-loss-action@' '
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; job_indent = -1; next }
+    in_jobs {
+      if ($0 ~ /^[[:space:]]*(#|$)/) { if (have) buf = buf $0 "\n"; next }
+      match($0, /^[[:space:]]*/); ind = RLENGTH
+      if (ind == 0) { in_jobs = 0; next }            # left the jobs: block
+      if (job_indent < 0) job_indent = ind
+      if (ind == job_indent) {
+        # A new job key: flush the previous block if it held the action.
+        if (have && index(buf, marker) > 0) { printf "%s", buf; found = 1; exit }
+        have = 1; buf = $0 "\n"; next
+      }
+      if (have) buf = buf $0 "\n"
+    }
+    END {
+      if (!found && have && index(buf, marker) > 0) printf "%s", buf
     }
   ' "$1"
 }
@@ -274,31 +401,49 @@ if [ "${gaps}" -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Assertion (c): watchdog caller contract.
+# Assertion (c): watchdog caller contract, SCOPED TO THE JOB THAT CALLS THE
+# ACTION. Every check below reads that job's block, so a decoy second job
+# (ubuntu-latest + full gate + permissions) cannot paper over a broken retry job.
 # ---------------------------------------------------------------------------
-# (c1) on.workflow_run.types is [completed].
-grep -Eq '^[[:space:]]+types:[[:space:]]*\[completed\][[:space:]]*$' "${watchdog}" \
+# (c1) on.workflow_run.types is EXACTLY [completed] — and lives inside the
+# `workflow_run:` block, so an unrelated `types: [completed]` under another
+# trigger cannot satisfy it.
+wr_types="$(workflow_run_types "${watchdog}" | tr -d '[:space:]')"
+[ "${wr_types}" = '[completed]' ] \
   || fail "(c) on.workflow_run.types must be [completed]"
 
-# (c2) the job gate tests both failure and cancelled conclusions.
-gate="$(gate_block "${watchdog}")"
+# (c2) locate the job that calls the shared action; the rest of (c) is scoped to
+# that job's block.
+job="$(retry_job "${watchdog}")"
+[ -n "${job}" ] \
+  || fail "(c) does not call southernlights-tech/retry-runner-loss-action@ (no job block references the action)"
+
+# (c3) the gate tests both failure and cancelled conclusions.
+gate="$(printf '%s\n' "${job}" | gate_block)"
 printf '%s' "${gate}" | grep -Fq "github.event.workflow_run.conclusion == 'failure'" \
   || fail "(c) job gate does not test conclusion == 'failure'"
 printf '%s' "${gate}" | grep -Fq "github.event.workflow_run.conclusion == 'cancelled'" \
   || fail "(c) job gate does not test conclusion == 'cancelled'"
 
-# (c3) runs-on: ubuntu-latest (the watchdog must not run on the watched pool).
-grep -Eq '^[[:space:]]+runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' "${watchdog}" \
+# (c4) runs-on: ubuntu-latest (the watchdog must not run on the watched pool).
+printf '%s\n' "${job}" | grep -Eq '^[[:space:]]+runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' \
   || fail "(c) runs-on must be ubuntu-latest"
 
-# (c4) the four permission scopes the shared action requires.
+# (c5) the four permission scopes the shared action requires. They are
+# legitimately workflow-level OR job-level; a job-level block replaces the
+# workflow one for that job, so when present it must carry all four.
+if printf '%s\n' "${job}" | grep -Eq '^[[:space:]]+permissions:[[:space:]]*$'; then
+  perms="$(printf '%s\n' "${job}" | permissions_block any)"
+else
+  perms="$(permissions_block 0 < "${watchdog}")"
+fi
 for scope in 'contents: read' 'actions: write' 'pull-requests: write' 'checks: read'; do
-  grep -Eq "^[[:space:]]+${scope}[[:space:]]*$" "${watchdog}" \
+  printf '%s\n' "${perms}" | grep -Eq "^[[:space:]]*${scope}[[:space:]]*$" \
     || fail "(c) missing required permission: ${scope}"
 done
 
-# (c5) it calls the pinned shared action.
-grep -Fq 'southernlights-tech/retry-runner-loss-action@' "${watchdog}" \
+# (c6) it calls the pinned shared action — inside that same job block.
+printf '%s' "${job}" | grep -Fq 'southernlights-tech/retry-runner-loss-action@' \
   || fail "(c) does not call southernlights-tech/retry-runner-loss-action@"
 
 # ---------------------------------------------------------------------------

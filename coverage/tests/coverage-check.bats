@@ -127,7 +127,7 @@ YAML
     [[ "$output" == *"1 excluded, 0 gaps"* ]]
 }
 
-@test "PASS: a workflow_call-only workflow is skipped as a gap" {
+@test "PASS: a workflow_call-only workflow is not a gap" {
     wf reusable2.yml <<'YAML'
 name: Reusable Only
 on:
@@ -146,6 +146,90 @@ YAML
     write_watchdog_single_line_gate
     run bash "${SCRIPT}"
     [ "$status" -eq 0 ]
+}
+
+# --- (a)/(c) parser robustness ----------------------------------------------
+
+@test "PASS (a): a sibling list key does not leak phantom allow-list entries" {
+    # A `branches:` list directly after `workflows:` must not be read as part of
+    # the allow-list (it used to yield a phantom 'main' entry).
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    branches:
+      - main
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"3 watched"* ]]
+    [[ "$output" != *"main"* ]]
+}
+
+@test "PASS (a): flow-style on.workflow_run.workflows parses every entry" {
+    # `workflows: [A, B, C]` used to report an empty allow-list.
+    sed -i \
+        -e 's|^    workflows:$|    workflows: [Test, Deploy to Dev, Retry on runner loss]|' \
+        -e '/^      - Test$/d' \
+        -e '/^      - Deploy to Dev$/d' \
+        -e '/^      - Retry on runner loss$/d' \
+        "${WATCHDOG}"
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"3 watched"* ]]
+    [[ "$output" == *"0 excluded, 0 gaps"* ]]
+}
+
+@test "PASS: an exclusion keeps interior quotes (true name, not mutilated)" {
+    # `tr -d "\"'"` used to turn `Don't deploy yet` into `Dont deploy yet`, so
+    # only the mutilated spelling satisfied the guard.
+    wf apostrophe.yml <<'YAML'
+name: Don't deploy yet
+on:
+  pull_request:
+YAML
+    export EXCLUDED="Don't deploy yet"
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"5 workflow(s)"* ]]
+    [[ "$output" == *"1 excluded, 0 gaps"* ]]
+}
+
+@test "PASS: a multi-line EXCLUDED list honours every name" {
+    wf one.yml <<'YAML'
+name: One
+on:
+  push:
+YAML
+    wf two.yml <<'YAML'
+name: Two
+on:
+  schedule:
+YAML
+    export EXCLUDED="One
+Two"
+    run bash "${SCRIPT}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"6 workflow(s)"* ]]
+    [[ "$output" == *"2 excluded, 0 gaps"* ]]
 }
 
 # --- (a) allow-list validity ------------------------------------------------
@@ -184,6 +268,20 @@ YAML
     run bash "${SCRIPT}"
     [ "$status" -ne 0 ]
     [[ "$output" == *"'Comment Bot' (comment.yml) is run-producing"* ]]
+}
+
+@test "FAIL (b): a workflow triggered only on merge_group is a gap" {
+    # An exotic trigger must still count as run-producing: the predicate is the
+    # complement of workflow_call-only, not an allow-list of known triggers.
+    wf merge.yml <<'YAML'
+name: Merge Queue
+on:
+  merge_group:
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"'Merge Queue' (merge.yml) is run-producing"* ]]
+    [[ "$output" == *"(b) 1 run-producing workflow(s) are silently unwatched"* ]]
 }
 
 @test "FAIL (b): a mixed trigger (push + workflow_call) is run-producing" {
@@ -264,6 +362,40 @@ YAML
     [[ "$output" == *"(c) on.workflow_run.types must be [completed]"* ]]
 }
 
+@test "FAIL (c): an unrelated types: [completed] does not satisfy workflow_run" {
+    # The check must read `types:` INSIDE on.workflow_run, and must reject a
+    # superset. Here workflow_run asks for [completed, requested] while a
+    # workflow_dispatch block carries the tempting `types: [completed]`.
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed, requested]
+  workflow_dispatch:
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"(c) on.workflow_run.types must be [completed]"* ]]
+}
+
 @test "FAIL (c): job gate must test conclusion == 'failure'" {
     sed -i "s/== 'failure'/== 'timed_out'/" "${WATCHDOG}"
     run bash "${SCRIPT}"
@@ -283,6 +415,46 @@ YAML
     run bash "${SCRIPT}"
     [ "$status" -ne 0 ]
     [[ "$output" == *"(c) runs-on must be ubuntu-latest"* ]]
+}
+
+@test "FAIL (c): a decoy second job cannot satisfy the contract" {
+    # The real retry job is self-hosted and gates only on 'failure'. A decoy
+    # 'notify' job has ubuntu-latest and the full gate. Assertion (c) must read
+    # ONLY the job that calls the action, so this must FAIL on the retry job's
+    # missing 'cancelled' arm (and never see the decoy).
+    cat > "${WATCHDOG}" <<'YAML'
+name: Retry on runner loss
+on:
+  workflow_run:
+    workflows:
+      - Test
+      - Deploy to Dev
+      - Retry on runner loss
+    types: [completed]
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+  checks: read
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: self-hosted
+    steps:
+      - uses: southernlights-tech/retry-runner-loss-action@v1
+  notify:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+      || github.event.workflow_run.conclusion == 'cancelled' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "decoy"
+YAML
+    run bash "${SCRIPT}"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"(c)"* ]]
+    [[ "$output" == *"cancelled"* ]]
 }
 
 @test "FAIL (c): must call the pinned retry action" {

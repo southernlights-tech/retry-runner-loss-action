@@ -110,11 +110,14 @@ and the action it guards can never drift apart by version.
    `pull_request_review` or `release` are therefore covered automatically. A
    workflow whose `on:` block is missing, scalar/flow-form (`on: [push]`) or empty
    fails the guard **by name** instead of being skipped.
-3. **Caller contract** -- the watchdog keeps `types: [completed]`, a job gate
-   testing both `conclusion == 'failure'` and `conclusion == 'cancelled'`,
-   `runs-on: ubuntu-latest`, the four permission scopes (`contents: read`,
-   `actions: write`, `pull-requests: write`, `checks: read`) and a step pinned to
-   `southernlights-tech/retry-runner-loss-action@...`.
+3. **Caller contract** -- scoped to the watchdog job that calls the action, so a
+   decoy second job cannot satisfy it: `types: [completed]` (exactly, inside
+   `on.workflow_run:`), a job gate testing both `conclusion == 'failure'` and
+   `conclusion == 'cancelled'`, `runs-on: ubuntu-latest`, the four permission
+   scopes (`contents: read`, `actions: write`, `pull-requests: write`,
+   `checks: read`; workflow-level or job-level) and a step pinned to
+   `southernlights-tech/retry-runner-loss-action@...`. If no job calls the
+   action the guard fails.
 4. **Stale-exclusion detection** -- every name in `excluded` must resolve to a
    real workflow `name:`, and no name may be both watched and excluded (a
    contradictory policy). Without this, a stale exclusion would silently mask a
