@@ -30,3 +30,46 @@ jobs:
           attempt: "1"
         env:
           GH_TOKEN: ${{ github.token }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The bats suite drives the script directly, so it cannot catch a typo in
+      # coverage/action.yml (input names, env mapping, action_path). The two
+      # smoke tests below exercise the SHIPPED surface instead.
+      - name: ShellCheck (coverage guard)
+        run: docker run --rm -v "$PWD":/mnt -w /mnt koalaman/shellcheck:stable coverage/scripts/coverage-check.sh
+
+      - name: Bats (coverage guard)
+        run: docker run --rm -v "$PWD":/code -w /code bats/bats:latest coverage/tests/coverage-check.bats
+
+      # Proves inputs -> env wiring and ${{ github.action_path }} resolve, and
+      # that consumer-relative paths (workspace CWD) are honoured.
+      - name: "Composite action smoke test (uses: ./coverage)"
+        uses: ./coverage
+        with:
+          watchdog: coverage/tests/fixtures/pass/watchdog.yml
+          workflows-dir: coverage/tests/fixtures/pass/workflows
+          excluded: |
+            Retry on runner loss
+
+      # Negative counterpart: asserts the guard fails AND that it fails for the
+      # EXPECTED reason. A bare non-zero exit is not enough — a crash, a missing
+      # env var or a typo in a path would satisfy that tautology too.
+      - name: Coverage guard must fail on an unguarded workflow
+        env:
+          WATCHDOG: coverage/tests/fixtures/fail/watchdog.yml
+          WORKFLOWS_DIR: coverage/tests/fixtures/fail/workflows
+          EXCLUDED: ""
+        run: |
+          set +e
+          out="$(bash coverage/scripts/coverage-check.sh 2>&1)"
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then echo "ERROR: guard passed but a gap exists"; exit 1; fi
+          echo "$out" | grep -qF "Deploy to Prod" || { echo "ERROR: failure was not the expected gap"; exit 1; }
+          echo "$out" | grep -qF "(b)" || { echo "ERROR: failure did not come from assertion (b)"; exit 1; }
+          echo "OK: guard correctly failed on the expected gap"

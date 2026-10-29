@@ -1,0 +1,32 @@
+name: Watchdog Coverage Guard
+description: >-
+  Fails when a run-producing workflow is neither in the runner-loss watchdog's
+  watched-workflow allow-list nor explicitly excluded, so the allow-list cannot
+  drift silently. Consumer-side by nature: it reads the caller's workflow files,
+  so the caller MUST check out the repository first.
+author: southernlights.tech
+inputs:
+  watchdog:
+    description: "Path to the watchdog workflow that declares on.workflow_run.workflows."
+    required: true
+  workflows-dir:
+    description: "Directory holding the repository's workflow files."
+    required: false
+    default: ".github/workflows"
+  excluded:
+    description: >-
+      Newline-separated workflow `name:` values deliberately NOT watched.
+      Each must resolve to a real workflow, or the guard fails (stale-exclusion
+      detection).
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Verify watchdog coverage
+      shell: bash
+      env:
+        WATCHDOG: ${{ inputs.watchdog }}
+        WORKFLOWS_DIR: ${{ inputs.workflows-dir }}
+        EXCLUDED: ${{ inputs.excluded }}
+      run: bash "${{ github.action_path }}/scripts/coverage-check.sh"
